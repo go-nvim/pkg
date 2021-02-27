@@ -1,0 +1,258 @@
+version: 2.1
+
+orbs:
+  codecov: codecov/codecov@volatile  # https://circleci.com/developer/orbs/orb/codecov/codecov
+
+executors:
+  linux:
+    parameters:
+      go_version:
+        description: "The Go version to use on the debian buster image for linux platform."
+        type: string
+    docker:
+      - image: "golang:<< parameters.go_version >>-buster"
+        auth:
+          username: $DOCKERHUB_USERNAME
+          password: $DOCKERHUB_PASSWORD
+    resource_class: large
+    working_directory: /go/src/go.nvim.dev/pkg
+
+  darwin:
+    parameters:
+      go_version:
+        description: "The Go version to use on the macos executor."
+        type: string
+    macos:
+      xcode: 12.4.0
+    resource_class: medium
+    environment:
+      CI: true
+      GOLANG_VERSION: "<< parameters.go_version >>"
+    working_directory: ~/go/src/go.nvim.dev/pkg
+
+  windows:
+    parameters:
+      go_version:
+        description: "The Go version to use on the windows machine executor."
+        type: string
+      shell:
+        type: enum
+        description: "The shell to use. Defaults to `bash.exe`."
+        enum: [ "bash.exe", "powershell.exe -ExecutionPolicy Bypass", "cmd.exe" ]
+        default: "bash.exe"
+    machine:
+      image: windows-server-2019-vs2019:stable
+      shell: "<< parameters.shell >>"
+    resource_class: windows.large
+    environment:
+      CI: true
+      GOLANG_VERSION: "<< parameters.go_version >>"
+    working_directory: ~/go/src/go.nvim.dev/pkg
+
+commands_aliases:
+  - go_cache_key: &go_cache_key go<< parameters.go_version >>-{{ arch }}-{{ checksum "~/.go_version" }}
+
+commands:
+  setup_git:
+    parameters:
+      os:
+        type: string
+    steps:
+      - when:
+          condition:
+            equal: [ "windows", "<< parameters.os >>" ]
+          steps:
+            - run: git config --global core.autocrlf false
+
+  setup_go:
+    parameters:
+      os:
+        type: string
+      go_version:
+        type: string
+    steps:
+      - when:
+          condition:
+            or: [ "darwin", "windows", "<< parameters.os >>" ]
+          steps:
+            - run:
+                name: Setup go runtime sha256 file
+                command: |
+                  case "<< parameters.os >>" in
+                    darwin)
+                      export GOLANG_DOWNLOAD_SHA256=6000a9522975d116bf76044967d7e69e04e982e9625330d9a539a8b45395f9a8
+                      ;;
+                    windows)
+                      export GOLANG_DOWNLOAD_SHA256=5cc88fa506b3d5c453c54c3ea218fc8dd05d7362ae1de15bb67986b72089ce93
+                      ;;
+                  esac
+                  echo "export GOLANG_DOWNLOAD_SHA256=$GOLANG_DOWNLOAD_SHA256" >> $BASH_ENV
+                  echo $GOLANG_DOWNLOAD_SHA256 > ~/.go_version
+
+      - when:  # darwin GOOS
+          condition:
+            equal: [ "darwin", "<< parameters.os >>" ]
+          steps:
+            - run:
+                # chown '/usr/local' needs to restore_cache into '/usr/local/go'
+                name: Set PATH and Fix directory permission
+                command: |
+                  echo 'export PATH=$HOME/go/bin:/usr/local/go/bin:$PATH' >> $BASH_ENV
+                  sudo chown distiller:staff /usr/local
+            - restore_cache:
+                name: "Restore Go runtime cache"
+                keys:
+                  - *go_cache_key
+            - run:
+                name: Install Go runnime
+                command: |
+                  if [ ! -d "/usr/local/go" ]; then
+                    /usr/bin/curl -sSL https://storage.googleapis.com/golang/go<< parameters.go_version >>.darwin-amd64.tar.gz | /usr/bin/tar xfz - -C '/usr/local'
+                  fi
+            - save_cache:
+                name: Save Go runtime cache
+                key: *go_cache_key
+                paths:
+                  - /usr/local/go
+                  - ~/.go_version
+
+      - when:  # windows GOOS
+          condition:
+            equal: [ "windows", "<< parameters.os >>" ]
+          steps:
+            - run:
+                # set GOPATH for the Windows docker container compatibility
+                name: Set PATH and GOPATH
+                command: |
+                  echo 'export PATH="/c/Users/circleci/gopath/bin:/c/go/bin:/c/neovim/bin:$PATH"' >> $BASH_ENV
+                  echo 'export GOPATH="/c/Users/circleci/gopath"' >> $BASH_ENV
+                  rm -rf /c/go
+            - restore_cache:
+                name: "Restore Go runtime cache"
+                keys:
+                  - *go_cache_key
+            - run:
+                name: Install Go runnime
+                working_directory: /
+                command: |
+                  if [ ! -d '/c/go' ]; then
+                    curl -sSLO https://storage.googleapis.com/golang/go<< parameters.go_version >>.windows-amd64.zip
+                    unzip -q go<< parameters.go_version >>.windows-amd64.zip
+                    rm -f go<< parameters.go_version >>.windows-amd64.zip
+                  fi
+            - save_cache:
+                name: Save Go runtime cache
+                key: *go_cache_key
+                paths:
+                  - /go
+                  - ~/.go_version
+
+  check_go:
+    steps:
+      - run:
+          name: Check Go environment
+          command: |
+            printenv | sort
+            echo
+            go version
+            echo
+            go env
+
+  setup_nvim:
+    parameters:
+      os:
+        type: string
+    steps:
+      - when:
+          condition:
+            equal: [ "linux", "<< parameters.os >>" ]
+          steps:
+            - run:
+                name: Install nvim binary
+                command: |
+                  curl -sSL https://github.com/neovim/neovim/releases/download/nightly/nvim-linux64.tar.gz | tar xfz - --strip-components=1 -C '/usr/local'
+                  nvim --version
+      - when:
+          condition:
+            equal: [ "darwin", "<< parameters.os >>" ]
+          steps:
+            - run:
+                name: Install nvim binary
+                command: |
+                  curl -sSL https://github.com/neovim/neovim/releases/download/nightly/nvim-macos.tar.gz | tar xfz - --strip-components=1 -C '/usr/local'
+                  nvim --version
+      - when:
+          condition:
+            equal: [ "windows", "<< parameters.os >>" ]
+          steps:
+            - run:
+                name: Install nvim binary
+                working_directory: /
+                command: |
+                  curl -sSLO https://github.com/neovim/neovim/releases/download/nightly/nvim-win64.zip
+                  unzip -q nvim-win64.zip
+                  rm -f nvim-win64.zip
+                  nvim.exe --version
+
+jobs_aliases:
+  - jobs_parameters: &jobs_parameters
+      parameters:
+        os:
+          description: "The OS name of executor."
+          type: enum
+          enum: [ "linux", "darwin", "windows" ]
+        go_version:
+          description: "The Go version to use on executor."
+          type: string
+
+jobs:
+  test:
+    <<: *jobs_parameters
+    executor:
+      name: "<< parameters.os >>"
+      go_version: "<< parameters.go_version >>"
+    steps:
+      - setup_git:
+          os: "<< parameters.os >>"
+      - checkout
+      - setup_go:
+          os: "<< parameters.os >>"
+          go_version: "<< parameters.go_version >>"
+      - check_go
+      - setup_nvim:
+          os: "<< parameters.os >>"
+
+  lint:
+    <<: *jobs_parameters
+    executor:
+      name: "<< parameters.os >>"
+      go_version: "<< parameters.go_version >>"
+    steps:
+      - setup_git:
+          os: "<< parameters.os >>"
+      - checkout
+      - setup_go:
+          os: "<< parameters.os >>"
+          go_version: "<< parameters.go_version >>"
+      - check_go
+      - setup_nvim:
+          os: "<< parameters.os >>"
+
+workflows_aliases:
+  - workflows_matrix: &workflows_matrix
+      matrix:
+        parameters:
+          os: [ "linux", "darwin", "windows" ]
+          go_version: [ "1.16" ]
+
+workflows:
+  version: 2
+  workflows:
+    jobs:
+      - test:
+          context: org-global
+          <<: *workflows_matrix
+
+      - lint:
+          context: org-global
+          <<: *workflows_matrix
